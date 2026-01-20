@@ -1,11 +1,9 @@
 /*
- * ESP32-S3 SIMPLE SLAVE
- * Upload to: Front Right (0x121), Back Right (0x122), Back Left (0x123)
- * 
- * IMPORTANT: Change ONLY the following 3 lines for each motor:
- * - MY_CAN_ID (command ID)
- * - MY_FB_ID (feedback ID)
- * - MOTOR_NAME (for Serial debug)
+ * ESP32-S3 OPTIMIZED SLAVE (Final Version - NO STALL PROTECTION)
+ * - Synced Telemetry (50ms)
+ * - Optimized Hardware CAN Filtering
+ * - CAN Timeout Safety ONLY
+ * * UPLOAD TO: FR (0x121), BR (0x122), BL (0x123)
  */
 
 #include <Arduino.h>
@@ -13,38 +11,39 @@
 #include "driver/twai.h"
 #include <Adafruit_NeoPixel.h>
 
-// ================== CHANGE THESE FOR EACH MOTOR ==================
+// ================== CHANGE PER MOTOR ==================
 #define MY_CAN_ID    0x121        // FR: 0x121 | BR: 0x122 | BL: 0x123
 #define MY_FB_ID     0x221        // FR: 0x221 | BR: 0x222 | BL: 0x223
-#define MOTOR_NAME   "Front Right" // FR: "Front Right" | BR: "Back Right" | BL: "Back Left"
-// =================================================================
+#define MOTOR_NAME   "Front Right"
+// ======================================================
 
+// --- PINS ---
 #define RGB_LED_PIN     6
 #define NUM_PIXELS      2
 #define LED_BRIGHTNESS  50
 
-#define CAN_TX_PIN GPIO_NUM_1
-#define CAN_RX_PIN GPIO_NUM_2
+#define CAN_TX_PIN      GPIO_NUM_1
+#define CAN_RX_PIN      GPIO_NUM_2
 
-#define ENCODER_A_PIN 4
-#define ENCODER_B_PIN 5
-#define PWM_PIN       10
-#define DIR_PIN       11
-#define PCNT_UNIT     PCNT_UNIT_0
-#define ENCODER_PPR   400
+#define ENCODER_A_PIN   4
+#define ENCODER_B_PIN   5
+#define PWM_PIN         10
+#define DIR_PIN         11
+#define PCNT_UNIT       PCNT_UNIT_0
 
-#define KP 0.1418
-#define KI 2.683
-#define KD 0.0
-#define MOTOR_GAIN   9.670
-#define MOTOR_OFFSET 350.574
+// --- TUNING & CONSTANTS ---
+#define ENCODER_PPR          400
+#define KP                   0.1418
+#define KI                   2.683
+#define KD                   0.0
+#define MOTOR_GAIN           9.670
+#define MOTOR_OFFSET         350.574
 
 #define PWM_FREQ             25000
 #define PWM_RESOLUTION       8
 #define PWM_MAX              255
 #define MIN_PWM_OUTPUT       20
-#define RPM_SAMPLE_TIME_MS   50
-#define CONTROL_LOOP_TIME_MS 50
+#define RPM_SAMPLE_TIME_MS   50  // 20Hz Update Rate
 #define EMA_ALPHA            0.3
 #define RPM_DEADBAND         5.0
 #define INTEGRAL_LIMIT       1000.0
@@ -64,6 +63,7 @@ typedef struct {
   float velocity;
 } __attribute__((packed)) motor_feedback_t;
 
+// --- GLOBALS ---
 float targetRPM = 0.0;
 float currentRPM = 0.0;
 float filteredRPM = 0.0;
@@ -79,15 +79,14 @@ float lastError = 0.0;
 bool firstRPM = true;
 
 unsigned long lastRPMTime = 0;
-unsigned long lastControlTime = 0;
 unsigned long lastCANUpdate = 0;
-unsigned long lastTelemTime = 0;
 unsigned long lastDebugTime = 0;
 
 bool canTimeoutDetected = false;
 uint32_t canRxCount = 0;
 uint32_t canTxCount = 0;
 
+// --- PROTOTYPES ---
 bool initCAN();
 void processCAN();
 void sendTelemetry();
@@ -98,6 +97,7 @@ void runPID();
 float calculateRPM(int16_t delta_ticks);
 void updateLED();
 
+// ================== SETUP ==================
 void setup() {
   pinMode(PWM_PIN, OUTPUT);
   digitalWrite(PWM_PIN, LOW);
@@ -105,17 +105,13 @@ void setup() {
   digitalWrite(DIR_PIN, LOW);
 
   Serial.begin(115200);
-  unsigned long startWait = millis();
-  while (!Serial && (millis() - startWait < 3000)) {
-    delay(10);
-  }
+  delay(1000); // Brief wait for USB
 
-  Serial.printf("\n\n=== %s SLAVE (CMD:0x%03X | FB:0x%03X) ===\n", 
-                MOTOR_NAME, MY_CAN_ID, MY_FB_ID);
+  Serial.printf("\n=== %s SLAVE (CMD:0x%03X | FB:0x%03X) ===\n", MOTOR_NAME, MY_CAN_ID, MY_FB_ID);
 
   statusLed.begin();
   statusLed.setBrightness(LED_BRIGHTNESS);
-  statusLed.fill(statusLed.Color(255, 255, 0)); // Yellow during init
+  statusLed.fill(statusLed.Color(255, 255, 0)); // Yellow = Init
   statusLed.show();
 
   if (!initCAN()) {
@@ -124,65 +120,57 @@ void setup() {
     statusLed.show();
     while(1) delay(100);
   }
-  Serial.println("✓ CAN Initialized");
+  Serial.println("✓ CAN Initialized (Hardware Filter Active)");
 
   ledcAttach(PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
   ledcWrite(PWM_PIN, 0);
 
   initPCNT();
-  Serial.println("✓ Encoder Initialized");
-
+  
   lastRPMTime = millis();
-  lastControlTime = millis();
   lastCANUpdate = millis();
-  lastTelemTime = millis();
   lastDebugTime = millis();
 
   statusLed.fill(statusLed.Color(0, 255, 0)); // Green = Ready
   statusLed.show();
-
-  Serial.println("✓ System Ready - Waiting for CAN commands...\n");
 }
 
+// ================== MAIN LOOP ==================
 void loop() {
   unsigned long now = millis();
 
-  processCAN();
-  checkCANTimeout();
+  processCAN();       // Read Incoming Commands
+  checkCANTimeout();  // Stop if Master dies
 
+  // --- SYNCED CONTROL LOOP (20Hz / 50ms) ---
   if (now - lastRPMTime >= RPM_SAMPLE_TIME_MS) {
-    measureRPM();
+    measureRPM();      // 1. Measure Physics
+    runPID();          // 2. React (Control Motor)
+    sendTelemetry();   // 3. Report Physics
+    
     lastRPMTime = now;
   }
 
-  if (now - lastControlTime >= CONTROL_LOOP_TIME_MS) {
-    runPID();
-    lastControlTime = now;
-  }
-
-  if (now - lastTelemTime >= 20) {
-    sendTelemetry();
-    lastTelemTime = now;
-  }
-
+  // Debug Print (1Hz)
   if (now - lastDebugTime >= 1000) {
-    Serial.printf("[DEBUG] RX:%lu TX:%lu | Target:%.1f Current:%.1f PWM:%d | Timeout:%s\n",
+    Serial.printf("[DEBUG] RX:%lu TX:%lu | Tgt:%.1f Cur:%.1f PWM:%d | %s\n",
                   canRxCount, canTxCount, targetRPM, currentRPM, currentPWM,
-                  canTimeoutDetected ? "YES" : "NO");
+                  canTimeoutDetected ? "TIMEOUT" : "OK");
     lastDebugTime = now;
   }
 
   updateLED();
 }
 
+// ================== CAN BUS ==================
 bool initCAN() {
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
   twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
   
-  // FILTER: Only accept messages with ID = MY_CAN_ID
+  // HARDWARE FILTER: Ignore everyone else's messages
   twai_filter_config_t f = {
     .acceptance_code = (MY_CAN_ID << 21),
-    .acceptance_mask = ~(0x7FF << 21), // Look at all 11 bits of ID
+    .acceptance_mask = ~(0x7FF << 21),
     .single_filter = true
   };
 
@@ -194,10 +182,8 @@ bool initCAN() {
 
 void processCAN() {
   twai_message_t msg;
-
   while (twai_receive(&msg, 0) == ESP_OK) {
     canRxCount++;
-
     if (msg.identifier == MY_CAN_ID && msg.data_length_code == sizeof(motor_cmd_t)) {
       motor_cmd_t cmd;
       memcpy(&cmd, msg.data, sizeof(cmd));
@@ -207,9 +193,6 @@ void processCAN() {
 
       targetRPM = rpm;
       lastCANUpdate = millis();
-
-      Serial.printf(">>> CMD RECEIVED: Speed:%d Dir:%d -> TargetRPM:%.2f\n",
-                    cmd.speed, cmd.direction, rpm);
     }
   }
 }
@@ -226,16 +209,11 @@ void sendTelemetry() {
 
   if (twai_transmit(&msg, 0) == ESP_OK) {
     canTxCount++;
-  } else {
-    Serial.println("✗ CAN TX Failed");
   }
 }
 
 void checkCANTimeout() {
   if (millis() - lastCANUpdate > CAN_TIMEOUT_MS) {
-    if (!canTimeoutDetected) {
-      Serial.println("⚠ CAN TIMEOUT - No commands received");
-    }
     targetRPM = 0;
     canTimeoutDetected = true;
   } else {
@@ -243,6 +221,7 @@ void checkCANTimeout() {
   }
 }
 
+// ================== ENCODER ==================
 void initPCNT() {
   pcnt_config_t ch0 = {
     .pulse_gpio_num = ENCODER_A_PIN,
@@ -259,7 +238,6 @@ void initPCNT() {
   pcnt_unit_config(&ch0);
   pcnt_counter_clear(PCNT_UNIT);
   pcnt_counter_resume(PCNT_UNIT);
-  last_pulse_count = 0;
 }
 
 void measureRPM() {
@@ -284,9 +262,11 @@ float calculateRPM(int16_t delta_ticks) {
   return (float)delta_ticks * 60000.0 / (CPR * RPM_SAMPLE_TIME_MS);
 }
 
+// ================== PID ==================
 void runPID() {
   float error = targetRPM - currentRPM;
 
+  // Deadband Check
   if (fabs(targetRPM) < 0.1 && fabs(currentRPM) < 5.0 && fabs(errorSum) < 1.0) {
     ledcWrite(PWM_PIN, 0);
     currentPWM = 0;
@@ -297,16 +277,20 @@ void runPID() {
   if (fabs(error) < RPM_DEADBAND) error = 0;
 
   float p = KP * error;
-  bool saturated = (currentPWM >= PWM_MAX && error > 0) ||
-                   (currentPWM <= -PWM_MAX && error < 0);
+  
+  // Anti-Windup
+  bool saturated = (currentPWM >= PWM_MAX && error > 0) || (currentPWM <= -PWM_MAX && error < 0);
   if (!saturated) {
-    errorSum += error * (CONTROL_LOOP_TIME_MS / 1000.0);
+    errorSum += error * (RPM_SAMPLE_TIME_MS / 1000.0);
     errorSum = constrain(errorSum, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
   }
+  
   float i = KI * errorSum;
   float d = KD * (error - lastError);
+  
   float ffMag = (fabs(targetRPM) + MOTOR_OFFSET) / MOTOR_GAIN;
   float ff = (targetRPM >= 0) ? ffMag : -ffMag;
+  
   float control = ff + p + i + d;
 
   if (control >= 0) {
@@ -317,14 +301,14 @@ void runPID() {
     currentPWM = (int)fabs(control);
   }
 
-  if (currentPWM > 0 && currentPWM < MIN_PWM_OUTPUT)
-    currentPWM = MIN_PWM_OUTPUT;
-
+  if (currentPWM > 0 && currentPWM < MIN_PWM_OUTPUT) currentPWM = MIN_PWM_OUTPUT;
   currentPWM = constrain(currentPWM, 0, PWM_MAX);
+  
   ledcWrite(PWM_PIN, currentPWM);
   lastError = error;
 }
 
+// ================== LED ==================
 void updateLED() {
   static unsigned long lastBlink = 0;
   static bool blinkState = false;
@@ -337,11 +321,11 @@ void updateLED() {
   uint32_t color = 0;
 
   if (canTimeoutDetected) {
-    color = blinkState ? statusLed.Color(255, 0, 255) : 0; // Magenta blink
+    color = blinkState ? statusLed.Color(255, 0, 255) : 0; // MAGENTA BLINK = TIMEOUT
   } else if (targetRPM != 0) {
-    color = statusLed.Color(0, 0, 255); // Blue when active
+    color = statusLed.Color(0, 0, 255); // BLUE = RUNNING
   } else if (blinkState) {
-    color = statusLed.Color(0, 50, 0); // Dim green blink when idle
+    color = statusLed.Color(0, 50, 0); // GREEN BLINK = IDLE
   }
 
   statusLed.fill(color);
